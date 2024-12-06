@@ -263,6 +263,7 @@ filegroup {
 // builds additional modules conditionally based on Makefile variables.
 phony {
     name: "recovery_deps",
+    recovery: true,
     required: [
         "mkfs.erofs.recovery",
         "dump.erofs.recovery",
