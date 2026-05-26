@@ -646,11 +646,11 @@ bool MinuiBackendDrmQti::FindAndSetMonitor(int fd, drmModeRes* resources) {
   };
 
   std::vector<drmModeConnector*> drmConnectors;
-  for (int i = 0; i < arraysize(kConnectorPriority) && drmConnectors.size() < DRM_MAX; i++) {
+  for (int i = 0; i < arraysize(kConnectorPriority) && drmConnectors.size() < 1; i++) {
     auto connectors = find_used_connector_by_type(fd, resources, kConnectorPriority[i]);
     for (auto connector : connectors) {
       drmConnectors.push_back(connector);
-      if (drmConnectors.size() >= DRM_MAX) break;
+      if (drmConnectors.size() >= 1) break;
     }
   }
 
