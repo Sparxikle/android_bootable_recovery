@@ -557,6 +557,7 @@ void MinuiBackendDrmQti::Blank(bool blank, DrmConnector index) {
 
   if (!ret) {
     printf("Atomic Commit failed, rc = %d\n", ret);
+  } else {
     current_blank_state = blank;
   }
 
@@ -696,7 +697,7 @@ void MinuiBackendDrmQti::DisableNonMainCrtcs(int fd, drmModeRes* resources,
       find_prop_id(&crtc_res, crtc, Crtc, crtc->crtc_id, "ACTIVE", prop_id, i);
       if (prop_id == 0) return;
 
-      if (drmModeAtomicAddProperty(atomic_req, drm[i].monitor_crtc->crtc_id, prop_id, 0) < 0)
+      if (drmModeAtomicAddProperty(atomic_req, crtc->crtc_id, prop_id, 0) < 0)
         return;
     }
     drmModeFreeCrtc(crtc);
@@ -863,10 +864,44 @@ GRSurface* MinuiBackendDrmQti::Init() {
     }
   }
 
-  /* Set plane resources */
-  for (uint32_t i = 0; i < number_of_lms; ++i) {
-    plane_res[i].plane = drmModeGetPlane(drm_fd, plane_options->planes[i]);
-    if (!plane_res[i].plane) return NULL;
+/* Set plane resources — only pick planes that can drive the main CRTC */
+  {
+    // Find the bit index of monitor_crtc in the resources crtc list
+    // (possible_crtcs is a bitmask indexed by position in res->crtcs[])
+    drmModeRes* res_tmp = drmModeGetResources(drm_fd);
+    int main_crtc_idx = -1;
+    if (res_tmp) {
+      for (int ci = 0; ci < res_tmp->count_crtcs; ci++) {
+        if (res_tmp->crtcs[ci] == drm[DRM_MAIN].monitor_crtc->crtc_id) {
+          main_crtc_idx = ci;
+          break;
+        }
+      }
+      drmModeFreeResources(res_tmp);
+    }
+
+    uint32_t planes_found = 0;
+    for (uint32_t pi = 0; pi < plane_options->count_planes && planes_found < number_of_lms; pi++) {
+      drmModePlane* plane = drmModeGetPlane(drm_fd, plane_options->planes[pi]);
+      if (!plane) continue;
+
+      bool crtc_match = (main_crtc_idx >= 0)
+                        ? (plane->possible_crtcs & (1u << main_crtc_idx))
+                        : true; // fallback: accept any if we couldn't find crtc index
+
+      if (crtc_match) {
+        plane_res[planes_found].plane = plane;
+        planes_found++;
+      } else {
+        drmModeFreePlane(plane);
+      }
+    }
+
+    if (planes_found < number_of_lms) {
+      fprintf(stderr, "Not enough planes for main CRTC: found %d, need %d\n",
+              planes_found, number_of_lms);
+      return NULL;
+    }
   }
 
   for (uint32_t i = 0; i < number_of_lms; ++i) {
