@@ -23,6 +23,10 @@
 
 #include <xf86drmMode.h>
 
+#include <map>
+#include <string>
+#include <vector>
+
 #include "graphics.h"
 #include "minui/minui.h"
 
@@ -69,6 +73,12 @@ class MinuiBackendDrm : public MinuiBackend {
   void DisableNonMainCrtcs(int fd, drmModeRes* resources, drmModeCrtc* main_crtc);
   bool FindAndSetMonitor(int fd, drmModeRes* resources);
 
+  // Qualcomm SDE split-pipe support: one plane per layer mixer, blocking atomic commits.
+  bool SdeSplitSetup(drmModeRes* resources);
+  bool SdeSplitCommit(uint32_t fb_id, bool modeset);
+  void SdeSplitDisable();
+  bool SdeSplitAddProp(drmModeAtomicReq* req, uint32_t obj_id, const char* name, uint64_t value);
+
   struct DrmInterface {
     std::unique_ptr<GRSurfaceDrm> GRSurfaceDrms[2];
     int current_buffer{ 0 };
@@ -79,4 +89,9 @@ class MinuiBackendDrm : public MinuiBackend {
 
   int drm_fd{ -1 };
   DrmConnector active_display = DRM_MAIN;
+
+  uint32_t sde_lms_{ 0 };  // 0 = legacy SetCrtc/PageFlip path
+  std::vector<uint32_t> sde_planes_;
+  std::map<uint32_t, std::map<std::string, uint32_t>> sde_prop_ids_;
+  uint32_t sde_mode_blob_{ 0 };
 };

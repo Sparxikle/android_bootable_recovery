@@ -20,6 +20,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -27,6 +28,7 @@
 #include <memory>
 
 #include <android-base/macros.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/unique_fd.h>
 #include <drm_fourcc.h>
@@ -167,6 +169,197 @@ bool MinuiBackendDrm::DrmEnableCrtc(int drm_fd, drmModeCrtc* crtc,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Qualcomm SDE split-pipe support
+//
+// On msm SDE (e.g. sm8250 / 4.19) a mode whose topology uses more than one layer
+// mixer (sde_dualpipe*, sde_quadpipe*) has to be fed one plane per mixer, each
+// scanning out its own vertical strip. A single full-width plane set up through
+// drmModeSetCrtc is accepted but never reaches the panel correctly, and legacy
+// page flips never signal completion. This mirrors the CAF/TWRP minui backend.
+// ---------------------------------------------------------------------------
+
+static std::map<std::string, uint32_t> get_prop_ids(int fd, uint32_t obj_id, uint32_t obj_type) {
+  std::map<std::string, uint32_t> ids;
+  drmModeObjectProperties* props = drmModeObjectGetProperties(fd, obj_id, obj_type);
+  if (!props) return ids;
+  for (uint32_t i = 0; i < props->count_props; i++) {
+    drmModePropertyRes* prop = drmModeGetProperty(fd, props->props[i]);
+    if (prop) {
+      ids[prop->name] = prop->prop_id;
+      drmModeFreeProperty(prop);
+    }
+  }
+  drmModeFreeObjectProperties(props);
+  return ids;
+}
+
+// Returns the number of layer mixers in the connector's SDE topology, or 0 if the
+// connector doesn't expose one (i.e. this isn't an SDE display).
+static uint32_t get_sde_layer_mixers(int fd, uint32_t connector_id) {
+  uint32_t lms = 0;
+  drmModeObjectProperties* props =
+      drmModeObjectGetProperties(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR);
+  if (!props) return 0;
+  for (uint32_t i = 0; i < props->count_props && lms == 0; i++) {
+    drmModePropertyRes* prop = drmModeGetProperty(fd, props->props[i]);
+    if (!prop) continue;
+    if (!strcmp(prop->name, "mode_properties")) {
+      drmModePropertyBlobRes* blob = drmModeGetPropertyBlob(fd, props->prop_values[i]);
+      if (blob) {
+        std::string data(static_cast<const char*>(blob->data), blob->length);
+        size_t pos = data.find("topology=");
+        if (pos != std::string::npos) {
+          std::string topology = data.substr(pos + 9, data.find('\n', pos) - pos - 9);
+          printf("SDE topology: %s\n", topology.c_str());
+          if (topology.rfind("sde_quadpipe", 0) == 0) {
+            lms = 4;
+          } else if (topology.rfind("sde_dualpipe", 0) == 0) {
+            lms = 2;
+          } else {
+            lms = 1;
+          }
+        }
+        drmModeFreePropertyBlob(blob);
+      }
+    }
+    drmModeFreeProperty(prop);
+  }
+  drmModeFreeObjectProperties(props);
+  return lms;
+}
+
+bool MinuiBackendDrm::SdeSplitAddProp(drmModeAtomicReq* req, uint32_t obj_id, const char* name,
+                                      uint64_t value) {
+  auto& ids = sde_prop_ids_[obj_id];
+  auto it = ids.find(name);
+  if (it == ids.end()) {
+    fprintf(stderr, "DRM object %u has no property %s\n", obj_id, name);
+    return false;
+  }
+  return drmModeAtomicAddProperty(req, obj_id, it->second, value) >= 0;
+}
+
+bool MinuiBackendDrm::SdeSplitSetup(drmModeRes* resources) {
+  DrmInterface* d = &drm[DRM_MAIN];
+  uint32_t lms = get_sde_layer_mixers(drm_fd, d->monitor_connector->connector_id);
+  if (lms == 0) {
+    printf("No SDE topology on connector, using legacy DRM path\n");
+    return false;
+  }
+
+  if (drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) != 0 ||
+      drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0) {
+    perror("Failed to enable atomic DRM client caps");
+    return false;
+  }
+
+  int crtc_index = -1;
+  for (int i = 0; i < resources->count_crtcs; i++) {
+    if (resources->crtcs[i] == d->monitor_crtc->crtc_id) crtc_index = i;
+  }
+  if (crtc_index < 0) return false;
+
+  drmModePlaneRes* planes = drmModeGetPlaneResources(drm_fd);
+  if (!planes) return false;
+  for (uint32_t i = 0; i < planes->count_planes && sde_planes_.size() < lms; i++) {
+    drmModePlane* plane = drmModeGetPlane(drm_fd, planes->planes[i]);
+    if (!plane) continue;
+    if (plane->possible_crtcs & (1u << crtc_index)) {
+      sde_planes_.push_back(plane->plane_id);
+    }
+    drmModeFreePlane(plane);
+  }
+  drmModeFreePlaneResources(planes);
+  if (sde_planes_.size() < lms) {
+    fprintf(stderr, "Only %zu usable planes for %u layer mixers\n", sde_planes_.size(), lms);
+    sde_planes_.clear();
+    return false;
+  }
+
+  uint32_t connector_id = d->monitor_connector->connector_id;
+  uint32_t crtc_id = d->monitor_crtc->crtc_id;
+  sde_prop_ids_[connector_id] = get_prop_ids(drm_fd, connector_id, DRM_MODE_OBJECT_CONNECTOR);
+  sde_prop_ids_[crtc_id] = get_prop_ids(drm_fd, crtc_id, DRM_MODE_OBJECT_CRTC);
+  for (uint32_t plane_id : sde_planes_) {
+    sde_prop_ids_[plane_id] = get_prop_ids(drm_fd, plane_id, DRM_MODE_OBJECT_PLANE);
+  }
+
+  if (drmModeCreatePropertyBlob(drm_fd, &d->monitor_crtc->mode, sizeof(drmModeModeInfo),
+                                &sde_mode_blob_) != 0) {
+    perror("Failed to create DRM mode blob");
+    return false;
+  }
+
+  sde_lms_ = lms;
+  printf("Using SDE split pipe: %u layer mixers\n", sde_lms_);
+  return true;
+}
+
+bool MinuiBackendDrm::SdeSplitCommit(uint32_t fb_id, bool modeset) {
+  DrmInterface* d = &drm[DRM_MAIN];
+  uint32_t connector_id = d->monitor_connector->connector_id;
+  uint32_t crtc_id = d->monitor_crtc->crtc_id;
+  uint32_t width = d->monitor_crtc->mode.hdisplay;
+  uint32_t height = d->monitor_crtc->mode.vdisplay;
+  uint32_t strip = width / sde_lms_;
+
+  drmModeAtomicReq* req = drmModeAtomicAlloc();
+  if (!req) return false;
+
+  // The connector/CRTC association is needed on every commit for SDE to keep the topology.
+  bool ok = SdeSplitAddProp(req, connector_id, "CRTC_ID", crtc_id);
+  if (modeset) {
+    ok = ok && SdeSplitAddProp(req, crtc_id, "MODE_ID", sde_mode_blob_) &&
+         SdeSplitAddProp(req, crtc_id, "ACTIVE", 1);
+  }
+  for (uint32_t i = 0; ok && i < sde_lms_; i++) {
+    uint32_t plane = sde_planes_[i];
+    uint32_t x = strip * i;
+    uint32_t w = (i == sde_lms_ - 1) ? width - x : strip;
+    ok = SdeSplitAddProp(req, plane, "FB_ID", fb_id);
+    if (ok && modeset) {
+      // zpos is optional; quad pipe puts the second pair of strips on a second stage.
+      if (sde_prop_ids_[plane].count("zpos")) {
+        SdeSplitAddProp(req, plane, "zpos", sde_lms_ == 4 ? (i >> 1) : 0);
+      }
+      ok = SdeSplitAddProp(req, plane, "CRTC_ID", crtc_id) &&
+           SdeSplitAddProp(req, plane, "SRC_X", static_cast<uint64_t>(x) << 16) &&
+           SdeSplitAddProp(req, plane, "SRC_Y", 0) &&
+           SdeSplitAddProp(req, plane, "SRC_W", static_cast<uint64_t>(w) << 16) &&
+           SdeSplitAddProp(req, plane, "SRC_H", static_cast<uint64_t>(height) << 16) &&
+           SdeSplitAddProp(req, plane, "CRTC_X", x) &&
+           SdeSplitAddProp(req, plane, "CRTC_Y", 0) &&
+           SdeSplitAddProp(req, plane, "CRTC_W", w) &&
+           SdeSplitAddProp(req, plane, "CRTC_H", height);
+    }
+  }
+
+  int ret = ok ? drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) : -EINVAL;
+  drmModeAtomicFree(req);
+  if (ret != 0) {
+    fprintf(stderr, "SDE atomic commit failed (modeset=%d): %d\n", modeset, ret);
+    return false;
+  }
+  return true;
+}
+
+void MinuiBackendDrm::SdeSplitDisable() {
+  DrmInterface* d = &drm[DRM_MAIN];
+  drmModeAtomicReq* req = drmModeAtomicAlloc();
+  if (!req) return;
+  bool ok = SdeSplitAddProp(req, d->monitor_connector->connector_id, "CRTC_ID", 0) &&
+            SdeSplitAddProp(req, d->monitor_crtc->crtc_id, "MODE_ID", 0) &&
+            SdeSplitAddProp(req, d->monitor_crtc->crtc_id, "ACTIVE", 0);
+  for (uint32_t plane : sde_planes_) {
+    ok = ok && SdeSplitAddProp(req, plane, "CRTC_ID", 0) && SdeSplitAddProp(req, plane, "FB_ID", 0);
+  }
+  if (!ok || drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) != 0) {
+    fprintf(stderr, "Failed to disable SDE split pipe\n");
+  }
+  drmModeAtomicFree(req);
+}
+
 void MinuiBackendDrm::Blank(bool blank) {
   Blank(blank, DRM_MAIN);
 }
@@ -188,6 +381,16 @@ void MinuiBackendDrm::Blank(bool blank, DrmConnector index) {
 
   if (!drmInterface->monitor_connector) {
     fprintf(stderr, "Unsupported. index = %d\n", index);
+    return;
+  }
+
+  if (sde_lms_ && index == DRM_MAIN) {
+    if (blank) {
+      SdeSplitDisable();
+    } else {
+      SdeSplitCommit(drmInterface->GRSurfaceDrms[drmInterface->current_buffer]->fb_id, true);
+      active_display = index;
+    }
     return;
   }
 
@@ -401,13 +604,20 @@ GRSurface* MinuiBackendDrm::Init() {
     }
   }
 
+  bool sde_split =
+      android::base::GetBoolProperty("ro.minui.drm_sde_split", false) && SdeSplitSetup(res);
+
   DisableNonMainCrtcs(drm_fd, res, drm[DRM_MAIN].monitor_crtc);
 
   drmModeFreeResources(res);
 
-  // We will likely encounter errors in the backend functions (i.e. Flip) if EnableCrtc fails.
-  if (!DrmEnableCrtc(drm_fd, drm[DRM_MAIN].monitor_crtc, drm[DRM_MAIN].GRSurfaceDrms[1],
-                     &drm[DRM_MAIN].monitor_connector->connector_id)) {
+  if (sde_split) {
+    if (!SdeSplitCommit(drm[DRM_MAIN].GRSurfaceDrms[1]->fb_id, true)) {
+      return nullptr;
+    }
+  } else if (!DrmEnableCrtc(drm_fd, drm[DRM_MAIN].monitor_crtc, drm[DRM_MAIN].GRSurfaceDrms[1],
+                            &drm[DRM_MAIN].monitor_connector->connector_id)) {
+    // We will likely encounter errors in the backend functions (i.e. Flip) if EnableCrtc fails.
     return nullptr;
   }
 
@@ -430,6 +640,15 @@ GRSurface* MinuiBackendDrm::Flip() {
   if (!current_drm->monitor_connector) {
     fprintf(stderr, "Unsupported. active_display = %d\n", active_display);
     return nullptr;
+  }
+
+  if (sde_lms_ && active_display == DRM_MAIN) {
+    // Blocking atomic commit; SDE doesn't signal legacy page flips on split pipes.
+    if (!SdeSplitCommit(current_drm->GRSurfaceDrms[current_drm->current_buffer]->fb_id, false)) {
+      return nullptr;
+    }
+    current_drm->current_buffer = 1 - current_drm->current_buffer;
+    return current_drm->GRSurfaceDrms[current_drm->current_buffer].get();
   }
 
   if (drmModePageFlip(drm_fd, current_drm->monitor_crtc->crtc_id,
@@ -467,6 +686,10 @@ GRSurface* MinuiBackendDrm::Flip() {
 }
 
 MinuiBackendDrm::~MinuiBackendDrm() {
+  if (sde_lms_) {
+    SdeSplitDisable();
+    drmModeDestroyPropertyBlob(drm_fd, sde_mode_blob_);
+  }
   for (int i = 0; i < DRM_MAX; i++) {
     if (drm[i].monitor_connector) {
       DrmDisableCrtc(drm_fd, drm[i].monitor_crtc);
