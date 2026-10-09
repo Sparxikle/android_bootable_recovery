@@ -94,4 +94,8 @@ class MinuiBackendDrm : public MinuiBackend {
   std::vector<uint32_t> sde_planes_;
   std::map<uint32_t, std::map<std::string, uint32_t>> sde_prop_ids_;
   uint32_t sde_mode_blob_{ 0 };
+  // msm dumb buffers are write-combined; blending reads from them are uncached and take
+  // seconds per frame at this resolution. Draw into cached memory and copy on flip.
+  std::unique_ptr<GRSurface> sde_shadow_;
+  void SdeSplitCopyShadow(GRSurfaceDrm* dst);
 };

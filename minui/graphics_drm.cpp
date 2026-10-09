@@ -344,6 +344,12 @@ bool MinuiBackendDrm::SdeSplitCommit(uint32_t fb_id, bool modeset) {
   return true;
 }
 
+void MinuiBackendDrm::SdeSplitCopyShadow(GRSurfaceDrm* dst) {
+  if (sde_shadow_ && dst) {
+    memcpy(dst->data(), sde_shadow_->data(), dst->row_bytes * dst->height);
+  }
+}
+
 void MinuiBackendDrm::SdeSplitDisable() {
   DrmInterface* d = &drm[DRM_MAIN];
   drmModeAtomicReq* req = drmModeAtomicAlloc();
@@ -388,6 +394,7 @@ void MinuiBackendDrm::Blank(bool blank, DrmConnector index) {
     if (blank) {
       SdeSplitDisable();
     } else {
+      SdeSplitCopyShadow(drmInterface->GRSurfaceDrms[drmInterface->current_buffer].get());
       SdeSplitCommit(drmInterface->GRSurfaceDrms[drmInterface->current_buffer]->fb_id, true);
       active_display = index;
     }
@@ -615,6 +622,13 @@ GRSurface* MinuiBackendDrm::Init() {
     if (!SdeSplitCommit(drm[DRM_MAIN].GRSurfaceDrms[1]->fb_id, true)) {
       return nullptr;
     }
+    const GRSurfaceDrm* fb = drm[DRM_MAIN].GRSurfaceDrms[0].get();
+    sde_shadow_ = GRSurface::Create(fb->width, fb->height, fb->row_bytes, fb->pixel_bytes);
+    if (sde_shadow_) {
+      memset(sde_shadow_->data(), 0, sde_shadow_->data_size());
+      return sde_shadow_.get();
+    }
+    fprintf(stderr, "Failed to allocate shadow buffer, drawing to the framebuffer\n");
   } else if (!DrmEnableCrtc(drm_fd, drm[DRM_MAIN].monitor_crtc, drm[DRM_MAIN].GRSurfaceDrms[1],
                             &drm[DRM_MAIN].monitor_connector->connector_id)) {
     // We will likely encounter errors in the backend functions (i.e. Flip) if EnableCrtc fails.
@@ -644,10 +658,12 @@ GRSurface* MinuiBackendDrm::Flip() {
 
   if (sde_lms_ && active_display == DRM_MAIN) {
     // Blocking atomic commit; SDE doesn't signal legacy page flips on split pipes.
+    SdeSplitCopyShadow(current_drm->GRSurfaceDrms[current_drm->current_buffer].get());
     if (!SdeSplitCommit(current_drm->GRSurfaceDrms[current_drm->current_buffer]->fb_id, false)) {
       return nullptr;
     }
     current_drm->current_buffer = 1 - current_drm->current_buffer;
+    if (sde_shadow_) return sde_shadow_.get();
     return current_drm->GRSurfaceDrms[current_drm->current_buffer].get();
   }
 
